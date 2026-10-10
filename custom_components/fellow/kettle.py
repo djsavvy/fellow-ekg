@@ -4,6 +4,7 @@ import logging
 import time
 import requests
 import re
+import struct
 from typing import Optional
 from dataclasses import dataclass
 
@@ -17,6 +18,44 @@ MAX_TOTAL_STEPS = 150     # safety cap (full range is ~120 steps, plus margin)
 
 # Guide mode presets (Fahrenheit values, in dial order left-to-right)
 GUIDE_PRESETS_F = (180, 195, 200, 205, 212)
+
+
+class KettleSettings:
+    """The 17-byte RT_Settings struct from `/api?…t=3` (see the repo docs:
+    docs/fellow-stagg-ekg-api.md). Verified against firmware 1.2.26.
+
+    The query string is fixed-order `i=,p=,d=,t=,s=` — the kettle's parser
+    walks it with strtol and rejects anything else, so it is built as a
+    literal string rather than params.
+    """
+
+    __slots__ = ("mask", "target_f", "clock", "counter", "units_fahrenheit")
+
+    def __init__(self, blob: bytes) -> None:
+        self.mask = struct.unpack_from("<H", blob, 0)[0]
+        self.target_f: Optional[float] = None
+        self.clock = "00:00"
+        self.counter = blob[16]
+        # Byte 1 of the presence mask distinguishes the display units in
+        # every observation on this kettle: 0x15 = °F, 0x17 = °C.
+        self.units_fahrenheit = (blob[1] & 0x02) == 0
+        target_raw = struct.unpack_from("<H", blob, 6)[0]
+        if self.units_fahrenheit:
+            # Plain degrees Fahrenheit (observed: 205 -> 0x00cd).
+            self.target_f = float(target_raw)
+        elif target_raw < 0x8000:
+            # The °C encoding was observed once as 0x80c0 for 90.5 °C and
+            # is not decoded; anything else here is treated as unusable.
+            self.target_f = None
+        hour, minute = blob[11], blob[10]
+        if hour < 24 and minute < 60:
+            self.clock = f"{hour:02d}:{minute:02d}"
+
+    @property
+    def target_c(self) -> Optional[float]:
+        if self.target_f is None:
+            return None
+        return round((self.target_f - 32) * 5 / 9, 2)
 
 
 class KettleTransientError(Exception):
@@ -117,6 +156,15 @@ class StaggEKGClient:
         self.session = requests.Session()
         self.session.headers.update({'User-Agent': 'StaggEKG-HA/1.0'})
 
+        # BLE telemetry (set by the integration's KettleBLE manager):
+        # latest KettleBLEState, or None when BLE is not running.
+        self.ble_state = None
+        # Whether we commanded the heater on (ss S_Heat) — the HTTP path
+        # cannot read the mode on 1.2.24+, so until a quick-status packet
+        # decodes authoritatively this is the fallback source of truth.
+        self.commanded_heat: Optional[bool] = None
+        self.last_settings: Optional[KettleSettings] = None
+
     def _send_command(self, cmd: str, retries: int = 1, timeout: float = 5.0) -> str:
         """Send a CLI command to the kettle, retrying on timeout.
 
@@ -128,6 +176,9 @@ class StaggEKGClient:
         up too far behind. If the kettle is still unresponsive after the
         final attempt, raise KettleTimeoutError so callers can distinguish
         it from other request failures.
+
+        On firmware 1.2.24+ commands execute blind (empty reply), which is
+        fine — `get_state` verifies through /api and BLE instead.
         """
         url = f"{self.base_url}/cli"
         params = {"cmd": cmd}
@@ -153,8 +204,102 @@ class StaggEKGClient:
             f"Kettle did not respond to '{cmd}' after {retries + 1} attempts: {last_timeout}"
         )
 
+    # ------------------------------------------------------------- /api read
+
+    def get_settings(self) -> Optional[KettleSettings]:
+        """GET the 17-byte RT_Settings struct from /api (t=3).
+
+        Returns None if the endpoint is missing/unusable, so callers can
+        fall back to the 1.1.x text interface.
+        """
+        url = f"{self.base_url}/api?i=0,p=0,d=0,t=3,s=1"
+        try:
+            response = self.session.get(url, timeout=5.0)
+        except requests.exceptions.RequestException:
+            return None
+        if response.status_code != 200 or len(response.content) != 17:
+            return None
+        settings = KettleSettings(response.content)
+        self.last_settings = settings
+        return settings
+
+    def build_state(self, refresh_settings: bool = True) -> KettleState:
+        """Build a KettleState from /api settings plus BLE telemetry.
+
+        With `refresh_settings=False` the last fetched settings are used,
+        so the BLE notify path can rebuild state without an HTTP request.
+
+        Raises KettleResponseError if neither source has ever produced data.
+        """
+        settings = self.get_settings() if refresh_settings else None
+        ble = self.ble_state
+        if settings is None:
+            settings = self.last_settings
+        if settings is None and ble is None:
+            raise KettleResponseError("no /api settings and no BLE telemetry")
+
+        units = 0 if (settings and settings.units_fahrenheit) else 1
+
+        current_temp_c: Optional[float] = None
+        heating: Optional[bool] = None
+        if ble is not None and ble.raw is not None and ble.is_fresh:
+            # Decode the raw triple in the kettle's display units.
+            a = ble.raw[0]
+            current_temp_c = (
+                round((a / 10 - 32) * 5 / 9, 2)
+                if settings and settings.units_fahrenheit
+                else round(a / 10, 2)
+            )
+            # Authoritative heating bit from a quick-status packet, else
+            # our own commanded state.
+            heating = ble.heating if ble.heating is not None else self.commanded_heat
+        elif self.commanded_heat is not None:
+            heating = self.commanded_heat
+
+        if heating is None:
+            mode = "unknown"
+        elif heating:
+            mode = "S_Heat"
+        else:
+            mode = "S_Off"
+
+        return KettleState(
+            mode=mode,
+            current_temp_c=current_temp_c,
+            set_temp_c=(
+                settings.target_c
+                if settings and settings.target_c is not None
+                else 0.0
+            ),
+            units=units,
+            clock=(settings.clock if settings else "00:00"),
+            ble_connected=bool(ble and ble.is_fresh),
+            heating=bool(heating) if heating is not None else False,
+            warming=False,
+        )
+
     def get_state(self) -> KettleState:
-        """Get the current state of the kettle"""
+        """Get the current state of the kettle.
+
+        Firmware 1.2.24+ silences the CLI text output, so the structured
+        /api endpoint plus BLE telemetry is the read path; the text parse
+        below only runs when /api answers nothing (older firmwares).
+        """
+        try:
+            state = self.build_state()
+            # `unknown` (no BLE telemetry, nothing commanded yet) is still
+            # a real state on 1.2.26 — the text reply there is empty, so
+            # falling through would only raise. Only fall back when /api
+            # itself is unusable (build_state raised).
+            return state
+        except KettleResponseError:
+            pass
+
+        # Fall back to the 1.1.x text interface.
+        return self._get_state_text()
+
+    def _get_state_text(self) -> KettleState:
+        """Read state from the 1.1.x `/cli?cmd=state` text output."""
         response = self._send_command("state")
 
         # Parse the response
@@ -228,34 +373,33 @@ class StaggEKGClient:
         if state.is_heating:
             _LOGGER.debug("Kettle already heating, skipping start command")
             return "already heating"
-        return self._send_command("ss S_Heat")
+        self._send_command("ss S_Heat")
+        self.commanded_heat = True
+        return "ok"
 
     def stop_heating(self, max_attempts: int = 3) -> str:
         """Stop heating or holding via direct state command.
 
-        `ss S_Off` puts the firmware in the Off state directly. We retry
-        and verify because some firmware revisions occasionally drop the
-        first command during a state transition.
+        `ss S_Off` puts the firmware in the Off state directly. On
+        1.2.24+ we track the commanded state ourselves (the text reply
+        is silenced); the retry loop still runs for 1.1.x where the
+        mode is readable.
         """
+        self._send_command("ss S_Off")
+        self.commanded_heat = False
         for attempt in range(max_attempts):
             state = self.get_state()
             if not state.is_heating and not state.is_holding:
                 return "stopped"
 
             _LOGGER.debug(
-                "Sending stop command (attempt %d/%d, mode=%s)",
+                "Kettle not stopped yet (attempt %d/%d, mode=%s)",
                 attempt + 1, max_attempts, state.mode,
             )
             self._send_command("ss S_Off")
             time.sleep(0.5)
 
-        # Final check
-        state = self.get_state()
-        if state.is_heating or state.is_holding:
-            _LOGGER.error(
-                "Failed to stop kettle after %d attempts (mode=%s)",
-                max_attempts, state.mode,
-            )
+        _LOGGER.warning("Kettle may not have stopped (mode=%s)", state.mode)
         return "stopped"
 
     def set_warming(self, on: bool) -> str:

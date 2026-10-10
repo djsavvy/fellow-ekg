@@ -6,11 +6,11 @@ from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
+from .const import CONF_BLE_ADDRESS, DOMAIN
 from .kettle import KettleTransientError, StaggEKGClient
 
 # After this many consecutive transient failures, give up holding the
@@ -46,6 +46,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         CONF_TEMP_SET_METHOD,
         entry.data.get(CONF_TEMP_SET_METHOD, TEMP_METHOD_DIRECT),
     )
+    ble_address = entry.options.get(
+        CONF_BLE_ADDRESS,
+        entry.data.get(CONF_BLE_ADDRESS, ""),
+    )
 
     # Create API client
     client = StaggEKGClient(host=host, temp_method=temp_method)
@@ -65,6 +69,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Fetch initial data
     await coordinator.async_config_entry_first_refresh()
+
+    # Start BLE telemetry when an address is configured. The stream is
+    # armed from the manager via the HTTP client (tstprd CLI) and pushes
+    # into the coordinator on every packet.
+    ble_manager = None
+    if ble_address:
+        from .ble import KettleBLE
+
+        async def arm_stream() -> None:
+            await hass.async_add_executor_job(
+                client._send_command, "tstprd 1000"
+            )
+
+        def on_ble_update() -> None:
+            """Refresh coordinator data from the latest BLE snapshot."""
+            coordinator.async_update_from_ble()
+
+        ble_manager = KettleBLE(
+            hass,
+            ble_address,
+            name=entry.title,
+            arm_stream=arm_stream,
+            on_update=on_ble_update,
+        )
+        client.ble_state = ble_manager.state
+        await ble_manager.start()
+        entry.async_on_unload(ble_manager.stop)
 
     # Store coordinator
     hass.data.setdefault(DOMAIN, {})
@@ -109,6 +140,18 @@ class StaggEKGDataUpdateCoordinator(DataUpdateCoordinator):
             name=DOMAIN,
             update_interval=timedelta(seconds=5),
         )
+
+    @callback
+    def async_update_from_ble(self) -> None:
+        """Push the latest BLE snapshot to subscribers without polling."""
+        try:
+            # No settings refresh here: packets arrive every second and the
+            # 5s poll already keeps /api current.
+            state = self.client.build_state(refresh_settings=False)
+        except Exception:  # noqa: BLE001
+            return
+        self._consecutive_transient_failures = 0
+        self.async_set_updated_data({"state": state})
 
     @property
     def recently_lifted(self) -> bool:

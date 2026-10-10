@@ -25,3 +25,9 @@ MAX_TEMP_F = 212  # Maximum in Fahrenheit (boiling point)
 # Internal value format ("2C" - 2x Celsius)
 MIN_VALUE_2C = 80   # 40°C * 2
 MAX_VALUE_2C = 200  # 100°C * 2
+
+# BLE telemetry (firmware 1.2.24+): the kettle's Bluetooth address, used
+# by the KettleBLE manager (ble.py) through Home Assistant's bluetooth
+# integration (the ESPHome proxies). Optional — without it the integration
+# still reads settings/target via /api but has no current temperature.
+CONF_BLE_ADDRESS = "ble_address"

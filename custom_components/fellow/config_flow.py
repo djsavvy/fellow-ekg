@@ -14,6 +14,7 @@ from homeassistant.exceptions import HomeAssistantError
 import homeassistant.helpers.config_validation as cv
 
 from .const import (
+    CONF_BLE_ADDRESS,
     CONF_TEMP_SET_METHOD,
     CONF_TEMPERATURE_UNIT,
     DOMAIN,
@@ -179,6 +180,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         current_method = self.config_entry.data.get(
             CONF_TEMP_SET_METHOD, TEMP_METHOD_DIRECT
         )
+        current_ble = self.config_entry.data.get(CONF_BLE_ADDRESS, "")
 
         return self.async_show_form(
             step_id="init",
@@ -192,6 +194,10 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                         CONF_TEMP_SET_METHOD,
                         default=current_method,
                     ): vol.In([TEMP_METHOD_DIRECT, TEMP_METHOD_DIAL]),
+                    vol.Optional(
+                        CONF_BLE_ADDRESS,
+                        description={"suggested_value": current_ble},
+                    ): str,
                 }
             ),
         )
