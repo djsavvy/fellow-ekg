@@ -138,7 +138,7 @@ class StaggEKGWaterHeater(CoordinatorEntity, WaterHeaterEntity):
         }
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        """Set new target temperature using batched dial rotation."""
+        """Set new target temperature (direct setsetting command, /api verified)."""
         temperature = kwargs.get("temperature")
         if temperature is None:
             return
