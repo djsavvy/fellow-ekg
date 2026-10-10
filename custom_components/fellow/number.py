@@ -87,9 +87,17 @@ class StaggEKGTargetTemperature(NumberEntity):
 
     @property
     def native_value(self) -> float | None:
-        """Return the target temperature from /api (via the coordinator)."""
+        """Return the target temperature in the entity's native unit."""
         if self.coordinator.data and "state" in self.coordinator.data:
-            return self.coordinator.data["state"].set_temp_c or None
+            set_c = self.coordinator.data["state"].set_temp_c
+            if not set_c:
+                return None
+            if (
+                self._attr_native_unit_of_measurement
+                == UnitOfTemperature.FAHRENHEIT
+            ):
+                return round(set_c * 9 / 5 + 32, 1)
+            return set_c
         return None
 
     async def async_set_native_value(self, value: float) -> None:
