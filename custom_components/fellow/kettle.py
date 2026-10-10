@@ -410,14 +410,17 @@ class StaggEKGClient:
             return self.warm_off()
 
     def _ensure_awake(self) -> KettleState:
-        """Wake the kettle if it's off via button 2. Returns current state.
+        """Wake the kettle if it's off. Returns current state.
 
-        Button 2 is the only clean wake path; it also starts heating as a
-        side effect. The kettle passes through transitional states (logo,
-        S_StartupToTempr, possibly S_Heat+menu) before settling.
+        1.1.x path only (pre-wake needed for dial rotation): button 2 is
+        the only clean wake path, and it also starts heating as a side
+        effect. On 1.2.26 the mode is often "unknown" (unreadable), and
+        pressing button 2 on a merely-unknown mode would start a real
+        heat cycle, so this method is now called ONLY from the dial
+        methods with a text-confirmed Off mode, never on unknown.
         """
         state = self.get_state()
-        if not state.is_off:
+        if state.mode == "unknown" or not state.is_off:
             return state
 
         _LOGGER.debug("Kettle is off — waking with button 2")
@@ -442,20 +445,16 @@ class StaggEKGClient:
         return self._send_command(f"setsetting guide {1 if enabled else 0}")
 
     def set_temperature(self, target_celsius: float) -> float:
-        """
-        Set target temperature, respecting guide mode when possible.
+        """Set the target temperature.
 
-        If guide mode is on and the target matches a preset, navigates to
-        that preset via dial rotation (left to reset, right to select).
-
-        If guide mode is on but the target doesn't match a preset,
-        temporarily disables guide mode, uses batched dial rotation, then
-        re-enables guide mode.
-
-        If guide mode is off, uses batched dial rotation directly.
-
-        Wakes the kettle if it's off (which also starts heating as a side
-        effect — there's no way to wake without heating).
+        On firmware 1.2.24+ (and any firmware where /api answers) this is a
+        single `setsetting settempr <F>` command with a patient read-back
+        through /api. The 1.1.x dial-rotation fallback is DANGEROUS on
+        1.2.26: its wake path presses button 2, which starts heating as a
+        side effect, and its `left`/`right` bursts load the kettle's HTTP
+        server hard enough to wedge its Wi-Fi stack (verified the hard way).
+        It now only runs when /api is unreachable (a pre-1.2 kettle with a
+        silent CLI), never after a mere read-back mismatch.
 
         Args:
             target_celsius: Desired target temperature in Celsius (40-100).
@@ -466,53 +465,41 @@ class StaggEKGClient:
         target_celsius = max(40.0, min(100.0, target_celsius))
         target_f = round(target_celsius * 9 / 5 + 32)
 
-        if self.temp_method == "direct":
-            return self._set_temperature_direct(target_f)
-
-        guide_on = self.get_guide_mode()
-        preset_index = (
-            GUIDE_PRESETS_F.index(target_f)
-            if guide_on and target_f in GUIDE_PRESETS_F
-            else None
-        )
-
-        if preset_index is not None:
-            return self._set_temperature_preset(preset_index, target_f)
-
-        return self._set_temperature_dial(target_celsius, guide_on)
+        return self._set_temperature_direct(target_f)
 
     def _set_temperature_direct(self, target_f: int) -> float:
-        """Set target temperature via direct firmware command.
+        """Set target temperature via `setsetting settempr <F>` with retries.
 
-        Sends `setsetting settempr <F>` and reads back the actual target
-        to confirm. Falls back to the dial-rotation method if the kettle
-        doesn't accept the command (older firmwares may not implement it).
+        The kettle applies the setting from its main loop, not the HTTP
+        thread, so the /api read-back can briefly show the previous target
+        (observed well past the old 0.3s settle). Retry the command and
+        read back patiently before giving up.
+
+        Never falls back to dial rotation on a mere read-back mismatch:
+        see set_temperature(). The dial path (which presses button 2 —
+        starting a heat cycle — and bursts `left`/`right` commands) is
+        reachable only via temp_method="dial", for pre-1.2 kettles.
         """
-        self._send_command(f"setsetting settempr {target_f}")
-        time.sleep(SETTLE_DELAY)
-        state = self.get_state()
-
-        # Verify: kettle should now report the requested target (within
-        # the precision of its display: 1F or 0.5C). If it didn't change,
-        # the firmware likely doesn't accept this command — fall back.
-        actual_f = round(state.set_temp_c * 9 / 5 + 32)
-        if abs(actual_f - target_f) > 1:
-            _LOGGER.warning(
-                "Direct settempr appears unsupported (asked %dF, got %dF); "
-                "falling back to dial rotation. Switch this device to the "
-                "'dial' temperature-setting method in options to skip this "
-                "probe in the future.",
-                target_f, actual_f,
-            )
-            target_celsius = (target_f - 32) * 5 / 9
-            guide_on = self.get_guide_mode()
-            return self._set_temperature_dial(target_celsius, guide_on)
-
-        _LOGGER.debug(
-            "Direct settempr set %dF (%.1fC), actual=%.1fC",
-            target_f, (target_f - 32) * 5 / 9, state.set_temp_c,
+        for attempt in range(3):
+            self._send_command(f"setsetting settempr {target_f}")
+            for _ in range(8):  # up to ~4s per attempt
+                time.sleep(0.5)
+                settings = self.get_settings()
+                if settings is not None and settings.target_f is not None:
+                    actual_f = round(settings.target_f)
+                    if abs(actual_f - target_f) <= 1:
+                        _LOGGER.debug(
+                            "settempr -> %dF confirmed (attempt %d)",
+                            actual_f, attempt + 1,
+                        )
+                        return settings.target_c
+        _LOGGER.warning(
+            "setsetting settempr %dF not confirmed by /api read-back; "
+            "giving up (no dial fallback on this firmware).",
+            target_f,
         )
-        return state.set_temp_c
+        settings = self.last_settings
+        return settings.target_c if settings and settings.target_c else (target_f - 32) * 5 / 9
 
     def _set_temperature_preset(self, preset_index: int, target_f: int) -> float:
         """Navigate to a guide mode preset by index."""
