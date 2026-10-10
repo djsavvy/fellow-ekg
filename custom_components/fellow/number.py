@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from homeassistant.components.number import (
@@ -27,6 +28,10 @@ _LOGGER = logging.getLogger(__name__)
 MIN_TEMP_F = 104
 MAX_TEMP_F = 212
 
+# Seconds of quiet before a slider burst results in one command to the
+# kettle. Short enough to feel instant, long enough to coalesce a drag.
+DEBOUNCE_SECONDS = 0.25
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -44,13 +49,15 @@ class StaggEKGTargetTemperature(NumberEntity):
     The water_heater entity only shows its temperature control in the
     more-info dialog; this one-liner gives the kettle a real slider.
 
-    Setting is a single `setsetting settempr` command with a patient
-    /api read-back (kettle applies settings from its main loop) — no
-    dial rotation and no button-2 wake (see kettle.py).
+    Setting is debounced (one `setsetting settempr` command per slider
+    burst, no inline read-back: the coordinator's poll confirms), so the
+    kettle's HTTP server never sees a burst of writes.
     """
 
     _attr_has_entity_name = True
     _attr_icon = "mdi:thermometer"
+    _send_task: asyncio.Task | None = None
+    _pending_target_c: float = 0.0
 
     def __init__(
         self, coordinator: StaggEKGDataUpdateCoordinator, entry: ConfigEntry
@@ -101,11 +108,32 @@ class StaggEKGTargetTemperature(NumberEntity):
         return None
 
     async def async_set_native_value(self, value: float) -> None:
-        """Set the target temperature."""
+        """Set the target temperature, debounced.
+
+        Each drag-drop fires a write; a burst would queue several blocking
+        commands on the kettle. Instead, cancel any pending send and wait
+        DEBOUNCE_SECONDS of quiet first: a burst results in exactly ONE
+        command carrying the latest value. No read-back: the coordinator's
+        5s poll confirms, so the entity tracks the kettle closely without
+        verifying inline.
+        """
         client: StaggEKGClient = self.coordinator.client
         # `value` arrives in the entity's native unit (the kettle's display
-        # unit); set_temperature takes Celsius.
+        # unit); send_set_temperature takes Celsius.
         if self._attr_native_unit_of_measurement == UnitOfTemperature.FAHRENHEIT:
             value = (value - 32) * 5 / 9
-        await self.hass.async_add_executor_job(client.set_temperature, float(value))
+        self._pending_target_c = float(value)
+        if self._send_task:
+            self._send_task.cancel()
+        self._send_task = asyncio.create_task(self._debounced_send(client))
+
+    async def _debounced_send(self, client: StaggEKGClient) -> None:
+        """Send the latest pending target after DEBOUNCE_SECONDS of quiet."""
+        try:
+            await asyncio.sleep(DEBOUNCE_SECONDS)
+        except asyncio.CancelledError:
+            return
+        target_c = self._pending_target_c
+        self._send_task = None
+        await self.hass.async_add_executor_job(client.send_set_temperature, target_c)
         await self.coordinator.async_request_refresh()

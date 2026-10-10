@@ -448,6 +448,26 @@ class StaggEKGClient:
         return self._send_command(f"setsetting guide {1 if enabled else 0}")
 
     def set_temperature(self, target_celsius: float) -> float:
+        """Blocking set with patient read-back. See send_set_temperature()."""
+        target_celsius = max(40.0, min(100.0, target_celsius))
+        target_f = round(target_celsius * 9 / 5 + 32)
+        return self._set_temperature_direct(target_f)
+
+    def send_set_temperature(self, target_celsius: float) -> None:
+        """Fire-and-forget target set: ONE command, no read-back.
+
+        The kettle applies `setsetting settempr` from its main loop, so an
+        immediate read-back races and a blocking retry loop only queues
+        duplicate commands during slider drags. Callers debounce and send
+        exactly one command per burst; the coordinator's regular /api poll
+        is the confirmation. (This is also friendlier to the kettle's HTTP
+        server, which wedges under bursts of CLI traffic.)
+        """
+        target_celsius = max(40.0, min(100.0, target_celsius))
+        target_f = round(target_celsius * 9 / 5 + 32)
+        self._send_command(f"setsetting settempr {target_f}")
+
+    def set_temperature(self, target_celsius: float) -> float:
         """Set the target temperature.
 
         On firmware 1.2.24+ (and any firmware where /api answers) this is a
