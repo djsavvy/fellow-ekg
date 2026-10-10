@@ -39,14 +39,17 @@ class KettleSettings:
         # Byte 1 of the presence mask distinguishes the display units in
         # every observation on this kettle: 0x15 = °F, 0x17 = °C.
         self.units_fahrenheit = (blob[1] & 0x02) == 0
-        target_raw = struct.unpack_from("<H", blob, 6)[0]
-        if self.units_fahrenheit:
-            # Plain degrees Fahrenheit (observed: 205 -> 0x00cd).
+        # Bytes 4-5 hold the live dial target in plain degrees
+        # (verified: dial 104 °F -> 0x0068; settempr 200 -> 0x00c8).
+        # Bytes 6-7 held a sticky 205 in every observation (some saved
+        # preset) and were previously mistaken for the target.
+        target_raw = struct.unpack_from("<H", blob, 4)[0]
+        if self.units_fahrenheit and 40 <= target_raw <= 212:
             self.target_f = float(target_raw)
-        elif target_raw < 0x8000:
-            # The °C encoding was observed once as 0x80c0 for 90.5 °C and
-            # is not decoded; anything else here is treated as unusable.
-            self.target_f = None
+        elif target_raw < 0x8000 and 40 <= target_raw <= 212:
+            # Plain degrees even in °C display mode; treated as unusable
+            # only when out of the physical dial range.
+            self.target_f = float(target_raw)
         hour, minute = blob[11], blob[10]
         if hour < 24 and minute < 60:
             self.clock = f"{hour:02d}:{minute:02d}"
