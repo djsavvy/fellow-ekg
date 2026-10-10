@@ -57,18 +57,17 @@ WATCHDOG_SECONDS = 20.0
 RECONNECT_DELAYS = (5.0, 15.0, 30.0, 60.0)
 
 # Quick-status packet layout (16 bytes, verified live on 1.2.26):
-#   [u32 ts][u16 seq][u8 ?][u8 flags][u8 state][u8 ?][u8 ?][u8 0]
-#   [u16 temp][u8 target_lo][u8 ?]
-#   flags bit 0x04 = heating element on (observed 0x01 idle, 0x05 heat,
-#   0x07 hold). state byte: 0x15 idle, 0x16 heat, 0x17 hold, 0x1a off.
-#   temp = °C×10 + 500 (e.g. 0x0547 = 1351 -> 85.1 °C = 185.2 °F at the
-#   target chime — confirmed against the kettle display and t=3 target).
-QUICK_STATUS_MODES = {
-    0x15: "S_Off",
-    0x16: "S_Heat",
-    0x17: "S_Hold",
-    0x1A: "S_Off",
-}
+#   [u32 ts][u16 seq][u8 flags][u8 0x01 const][u8 0x55 const][u8 state]
+#   [u16 ?][u8 0x00][u16 temp][u8 target_lo][u8 checksum-ish]
+#   flags @6: bit 0x04 = heating element on, bit 0x02 = hold-at-target
+#   (observed: 0x00 idle/off, 0x05 heat, 0x07 hold).
+#   state @9 is a substate, not a clean enum (0x15 idle, 0x16 ramp,
+#   0x17 at-target, 0x1a post-cycle, 0x1c hold variant) — flags are the
+#   authoritative mode signal; the byte is kept for diagnostics only.
+#   temp @12 = °C×10 + 500 (0x0547 -> 85.1 °C = 185.2 °F, confirmed
+#   against the kettle display and the t=3 target).
+QUICK_STATUS_FLAGS_HEAT = 0x04
+QUICK_STATUS_FLAGS_HOLD = 0x02
 
 # Plausibility window for decoded °C (water temp).
 TEMP_PLAUSIBLE_C = (0.0, 110.0)
@@ -102,7 +101,9 @@ class KettleBLEState:
     seq: int | None = None
     # Authoritative heating bit from a quick-status packet, if decoded.
     heating: bool | None = None
-    # Kettle mode from the quick-status state byte (S_Heat/S_Hold/S_Off).
+    # Hold-at-target flag from the quick-status packet.
+    holding: bool | None = None
+    # Kettle mode (S_Heat/S_Hold/S_Off) from the quick-status flags.
     mode: str | None = None
     # Raw quick-status packet bytes for diagnostics.
     quick_raw: bytes | None = None
@@ -344,11 +345,18 @@ class KettleBLE:
         )
         if len(data) < 16:
             return
-        flags = data[7]
-        state_byte = data[9]
+        flags = data[6]
         temp_c = decode_temp_c(_u16(data, 12))
-        self.state.heating = bool(flags & 0x04) if flags else None
-        self.state.mode = QUICK_STATUS_MODES.get(state_byte)
+        heating = bool(flags & QUICK_STATUS_FLAGS_HEAT)
+        holding = bool(flags & QUICK_STATUS_FLAGS_HOLD)
+        if heating and holding:
+            self.state.mode = "S_Hold"
+        elif heating:
+            self.state.mode = "S_Heat"
+        else:
+            self.state.mode = "S_Off"
+        self.state.heating = heating
+        self.state.holding = holding
         self.state.quick_raw = bytes(data)
         if temp_c is not None:
             self.state.current_temp_c = temp_c
