@@ -56,9 +56,32 @@ WATCHDOG_SECONDS = 20.0
 # Reconnect backoff.
 RECONNECT_DELAYS = (5.0, 15.0, 30.0, 60.0)
 
-# Plausibility windows for accepting decoded values (raw, unit×10).
-TEMP_PLAUSIBLE_F10 = (400, 2130)  # 40..213 °F
-TEMP_PLAUSIBLE_C10 = (200, 1000)  # 20..100 °C
+# Quick-status packet layout (16 bytes, verified live on 1.2.26):
+#   [u32 ts][u16 seq][u8 ?][u8 flags][u8 state][u8 ?][u8 ?][u8 0]
+#   [u16 temp][u8 target_lo][u8 ?]
+#   flags bit 0x04 = heating element on (observed 0x01 idle, 0x05 heat,
+#   0x07 hold). state byte: 0x15 idle, 0x16 heat, 0x17 hold, 0x1a off.
+#   temp = °C×10 + 500 (e.g. 0x0547 = 1351 -> 85.1 °C = 185.2 °F at the
+#   target chime — confirmed against the kettle display and t=3 target).
+QUICK_STATUS_MODES = {
+    0x15: "S_Off",
+    0x16: "S_Heat",
+    0x17: "S_Hold",
+    0x1A: "S_Off",
+}
+
+# Plausibility window for decoded °C (water temp).
+TEMP_PLAUSIBLE_C = (0.0, 110.0)
+
+
+def decode_temp_c(raw: int) -> float | None:
+    """Decode a kettle temperature word: °C×10 + 500."""
+    if raw < 500:
+        return None
+    temp_c = (raw - 500) / 10.0
+    if TEMP_PLAUSIBLE_C[0] <= temp_c <= TEMP_PLAUSIBLE_C[1]:
+        return round(temp_c, 1)
+    return None
 
 
 def _u16(buf: bytes, off: int) -> int:
@@ -79,6 +102,10 @@ class KettleBLEState:
     seq: int | None = None
     # Authoritative heating bit from a quick-status packet, if decoded.
     heating: bool | None = None
+    # Kettle mode from the quick-status state byte (S_Heat/S_Hold/S_Off).
+    mode: str | None = None
+    # Raw quick-status packet bytes for diagnostics.
+    quick_raw: bytes | None = None
     last_seen: datetime | None = None
 
     @property
@@ -288,10 +315,15 @@ class KettleBLE:
             _LOGGER.debug("BLE %s: short temp packet %s", self.name, bytes(data).hex())
             return
         a, b, c = _u16(data, 6), _u16(data, 8), _u16(data, 10)
-        # The kettle reports in its display units (unit×10). Conversion to
-        # °C happens in the snapshot accessor (which knows the units); here
-        # we just keep the raw triple.
+        # Words are °C×10+500 (verified live); `a` is the filtered water
+        # temp. Keep the raw triple — decode via decode_temp_c at the
+        # consumer. Only the quick-status packet is authoritative for
+        # mode/heating, so b2 never touches those fields here.
         self.state.raw = (a, b, c)
+        if self.state.current_temp_c is None:
+            temp_c = decode_temp_c(a)
+            if temp_c is not None:
+                self.state.current_temp_c = temp_c
         self.state.seq = _u16(data, 4)
         self.state.last_seen = dt_util.utcnow()
         _LOGGER.debug(
@@ -300,31 +332,28 @@ class KettleBLE:
         self._publish()
 
     def _handle_quick_status(self, _handle: int, data: bytearray) -> None:
-        """Quick-status packet (on change). Fields decoded from the 1.1.75
-        image's Notify::send_quick_status: flags byte and a temperature.
+        """Quick-status packet — the kettle's authoritative status.
 
-        The observed packet length is 16 bytes with the interesting bytes
-        at offsets 11 (flags) and 12..13 not confirmed; until the layout is
-        verified live, accept only plausibly-decoded values and log the
-        raw packet for future decoding.
+        Layout verified live on 1.2.26 (armed via an RT_Params t=5 type-3
+        event; see kettle.arm_ble_streams): flags@7 (bit 0x04 heating),
+        state@9, temp u16@12 (°C×10+500), target_lo@14. State byte map:
+        0x15 idle, 0x16 heat, 0x17 hold, 0x1a off (see QUICK_STATUS_MODES).
         """
         _LOGGER.debug(
             "BLE %s: quick status %s", self.name, bytes(data).hex()
         )
-        if len(data) < 20:
+        if len(data) < 16:
             return
-        # Working layout (20-byte form): u32 ts @4, flags @11, temp u16 @16.
-        flags = data[11]
-        temp_raw = _u16(data, 16)
-        heating = bool(flags & 0x02) if flags else None
-        if (
-            TEMP_PLAUSIBLE_F10[0] <= temp_raw <= TEMP_PLAUSIBLE_F10[1]
-            or TEMP_PLAUSIBLE_C10[0] <= temp_raw <= TEMP_PLAUSIBLE_C10[1]
-        ):
-            self.state.heating = heating
-            self.state.last_seen = dt_util.utcnow()
-            self._publish()
-        # else: not decodable yet — keep the periodic stream authoritative
+        flags = data[7]
+        state_byte = data[9]
+        temp_c = decode_temp_c(_u16(data, 12))
+        self.state.heating = bool(flags & 0x04) if flags else None
+        self.state.mode = QUICK_STATUS_MODES.get(state_byte)
+        self.state.quick_raw = bytes(data)
+        if temp_c is not None:
+            self.state.current_temp_c = temp_c
+        self.state.last_seen = dt_util.utcnow()
+        self._publish()
 
     def _handle_settings(self, _handle: int, data: bytearray) -> None:
         """17-byte settings struct pushed on change (same as /api t=3).

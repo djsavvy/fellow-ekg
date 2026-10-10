@@ -78,9 +78,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         from .ble import KettleBLE
 
         async def arm_stream() -> None:
-            await hass.async_add_executor_job(
-                client._send_command, "tstprd 1000"
-            )
+            """Arm both notify streams: tstprd (b2) + RT_Params type 3 (b1)."""
+            await hass.async_add_executor_job(client.arm_ble_streams)
 
         def on_ble_update() -> None:
             """Refresh coordinator data from the latest BLE snapshot."""

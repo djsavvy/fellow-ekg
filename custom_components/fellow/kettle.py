@@ -8,6 +8,8 @@ import struct
 from typing import Optional
 from dataclasses import dataclass
 
+from .ble import decode_temp_c
+
 _LOGGER = logging.getLogger(__name__)
 
 # Dial rotation constants
@@ -245,26 +247,32 @@ class StaggEKGClient:
 
         current_temp_c: Optional[float] = None
         heating: Optional[bool] = None
-        if ble is not None and ble.raw is not None and ble.is_fresh:
-            # Decode the raw triple in the kettle's display units.
-            a = ble.raw[0]
-            current_temp_c = (
-                round((a / 10 - 32) * 5 / 9, 2)
-                if settings and settings.units_fahrenheit
-                else round(a / 10, 2)
-            )
-            # Authoritative heating bit from a quick-status packet, else
-            # our own commanded state.
-            heating = ble.heating if ble.heating is not None else self.commanded_heat
-        elif self.commanded_heat is not None:
-            heating = self.commanded_heat
+        mode = "unknown"
 
-        if heating is None:
-            mode = "unknown"
-        elif heating:
-            mode = "S_Heat"
-        else:
-            mode = "S_Off"
+        if ble is not None and ble.is_fresh:
+            # The quick-status packet is the kettle's own status (mode,
+            # heating flag, temp) — the single source of truth. When BLE
+            # is configured we report exactly what the kettle says and
+            # never substitute our commanded state: a stale "off" while
+            # the kettle heats is the bug this replaces.
+            current_temp_c = ble.current_temp_c
+            if current_temp_c is None and ble.raw is not None:
+                current_temp_c = decode_temp_c(ble.raw[0])
+            heating = ble.heating
+            if ble.mode is not None:
+                mode = ble.mode
+            elif heating is not None:
+                mode = "S_Heat" if heating else "S_Off"
+            if ble.heating is None:
+                heating = None  # unknown, not commanded
+        elif ble is None:
+            # No BLE configured (pre-1.2 kettles): fall back to our own
+            # commanded state, as the text CLI path always did.
+            if self.commanded_heat is not None:
+                heating = self.commanded_heat
+                mode = "S_Heat" if heating else "S_Off"
+
+        warming = mode == "S_Hold"
 
         return KettleState(
             mode=mode,
@@ -278,7 +286,7 @@ class StaggEKGClient:
             clock=(settings.clock if settings else "00:00"),
             ble_connected=bool(ble and ble.is_fresh),
             heating=bool(heating) if heating is not None else False,
-            warming=False,
+            warming=warming,
         )
 
     def get_state(self) -> KettleState:
@@ -624,6 +632,40 @@ class StaggEKGClient:
             if steps > 1:
                 time.sleep(STEP_DELAY)
         return result
+
+    # ------------------------------------------------------------ BLE arming
+
+    def _post_rt_params(self, event_type: int, ordinal: int, value: int) -> None:
+        """POST one RT_Params event (t=5, 8-byte body) to the kettle.
+
+        Layout (from the firmware's RT_Params handler): [u16 type][u16
+        ordinal][u32 value]. Type 3 sets the quick-status notify period —
+        what the Fellow app sends to get state pushes on b1.
+        """
+        body = struct.pack(
+            "<HHI", event_type & 0xFFFF, ordinal & 0x7FFF, value & 0xFFFFFFFF
+        )
+        url = f"{self.base_url}/api?i=0,p=0,d=0,t=5,s=1"
+        try:
+            self.session.post(url, data=body, timeout=5.0)
+        except requests.exceptions.RequestException as exc:
+            _LOGGER.debug("RT_Params post (type %d) failed: %s", event_type, exc)
+
+    def arm_ble_streams(self, period_ms: int = 1000) -> None:
+        """Arm both BLE notify streams.
+
+        `tstprd` arms the debug-temperature stream (b2). The quick-status
+        stream (b1) is armed by an RT_Params event (t=5 type 3) — decoded
+        from the firmware's `set_notif_interval_ms`, verified live. Both
+        are runtime-only notification timers (cleared by a kettle
+        reboot; no settings or state machine are touched), so the BLE
+        manager re-arms after every connect and from its watchdog.
+        A fresh session id each call sidesteps the ordinal anti-replay.
+        """
+        self._send_command(f"tstprd {period_ms}")
+        session = int(time.time()) & 0xFFFF or 1
+        self._post_rt_params(0, 0, session)  # open/switch session
+        self._post_rt_params(3, 1, period_ms)  # quick-status period
 
     def set_units_fahrenheit(self) -> str:
         """Set temperature units to Fahrenheit"""
