@@ -13,6 +13,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import StaggEKGDataUpdateCoordinator
 from .const import (
@@ -43,7 +44,7 @@ async def async_setup_entry(
     async_add_entities([StaggEKGTargetTemperature(coordinator, entry)])
 
 
-class StaggEKGTargetTemperature(NumberEntity):
+class StaggEKGTargetTemperature(CoordinatorEntity, NumberEntity):
     """Target temperature, as a plain slider on any dashboard card.
 
     The water_heater entity only shows its temperature control in the
@@ -63,9 +64,8 @@ class StaggEKGTargetTemperature(NumberEntity):
         self, coordinator: StaggEKGDataUpdateCoordinator, entry: ConfigEntry
     ) -> None:
         """Initialize the number entity."""
-        super().__init__()
-        self.coordinator = coordinator
         self._entry = entry
+        super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_target_temp_number"
         self._attr_name = "Target Temperature"
         self._attr_mode = NumberMode.BOX  # slider set via the card

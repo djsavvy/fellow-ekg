@@ -80,11 +80,12 @@ class StaggEKGCurrentTempSensor(StaggEKGSensorBase):
 
 
 class StaggEKGTargetTempSensor(StaggEKGSensorBase):
-    """Target temperature sensor."""
+    """Read-only target temperature: mirrors the kettle's dial/saved target."""
 
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_icon = "mdi:thermometer"
 
     def __init__(
         self, coordinator: StaggEKGDataUpdateCoordinator, entry: ConfigEntry
@@ -92,7 +93,7 @@ class StaggEKGTargetTempSensor(StaggEKGSensorBase):
         """Initialize the sensor."""
         super().__init__(coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_target_temp"
-        self._attr_name = "Target Temperature"
+        self._attr_name = "Dial Target Temperature"
 
     @property
     def native_value(self) -> float | None:
